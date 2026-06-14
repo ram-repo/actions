@@ -1,0 +1,214 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Consumer Workflow: Mono-repo — Merge-as-Release Pattern
+#
+# A single workflow manages multiple data products living under data-products/.
+# Production publish is gated on merge to main (or workflow_dispatch with
+# force-production-publish). All other events publish to snapshot.
+#
+# Repository structure assumed:
+#   data-products/
+#     product-a/
+#       manifest.yaml
+#       dataproduct.yaml
+#       ...
+#     product-b/
+#       manifest.yaml
+#       ...
+#   data-assets/
+#     product-a/
+#       <asset_id>/
+#         <file>
+#     product-b/
+#       ...
+# ─────────────────────────────────────────────────────────────────────────────
+name: DAAP — Publish & Deploy (Mono-repo / Merge-as-Release)
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, closed]
+    paths:
+      - "data-products/**"
+      - "data-assets/**"
+
+  push:
+    # Non-main branch pushes publish to snapshot Artifactory.
+    # The main branch is covered by the pull_request closed+merged event.
+    branches-ignore: [main]
+    paths:
+      - "data-products/**"
+      - "data-assets/**"
+
+  workflow_dispatch:
+    inputs:
+      force-production-publish:
+        description: >
+          Force publish to production Artifactory.
+          Use to retry after a transient network failure.
+          Main branch only.
+        type: boolean
+        default: false
+      products:
+        description: |
+          Product names (folder names only, not full paths) to re-publish,
+          one per line. Leave empty to auto-detect changed products from the
+          last merge (HEAD^1 vs HEAD).
+          Example:  product-a
+          Example:  product-a
+                    product-b
+        type: string
+        default: ""
+
+# Only one publish+deploy run per ref at a time; cancel in-progress on new push.
+concurrency:
+  group: daap-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB: publish
+  # ────────────────────────────────────────────────────────────────────────────
+  publish:
+    # Skip workflow runs triggered by a PR that was closed without merging.
+    if: github.event.action != 'closed' || github.event.pull_request.merged == 'true'
+    runs-on: ubuntu-latest
+
+    outputs:
+      published-packages: ${{ steps.build-publish.outputs.published-packages }}
+
+    steps:
+      - name: Checkout (full history for change detection)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Guard: force-production-publish is only valid on main ──────────────
+      - name: Validate branch for force-production-publish
+        if: inputs.force-production-publish == true && github.ref != 'refs/heads/main'
+        shell: bash
+        run: |
+          echo "::error::force-production-publish is only supported on the main branch."
+          echo "::error::Current ref: ${{ github.ref }}"
+          exit 1
+
+      # ── Resolve SHAs and product paths per trigger type ───────────────────
+      - name: Resolve trigger context
+        id: config
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # PR event: full change detection using PR base → head
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.sha }}"                          >> "$GITHUB_OUTPUT"
+            echo "paths=data-products"                             >> "$GITHUB_OUTPUT"
+
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            # Branch push: HEAD^1 → HEAD change detection; routes to snapshot
+            echo "base=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+            echo "head=$(git rev-parse HEAD)"   >> "$GITHUB_OUTPUT"
+            echo "paths=data-products"          >> "$GITHUB_OUTPUT"
+
+          elif [[ -n "${{ inputs.products }}" ]]; then
+            # workflow_dispatch with explicit product names:
+            #   - construct full paths from names so the action uses explicit mode
+            #   - leave base/head empty → change detection skipped
+            echo "base=" >> "$GITHUB_OUTPUT"
+            echo "head=" >> "$GITHUB_OUTPUT"
+            {
+              echo "paths<<ENDOFPATHS"
+              while IFS= read -r name; do
+                [[ -z "$name" ]] && continue
+                echo "data-products/${name}"
+              done <<< "${{ inputs.products }}"
+              echo "ENDOFPATHS"
+            } >> "$GITHUB_OUTPUT"
+
+          else
+            # workflow_dispatch without explicit products:
+            #   detect changed products via HEAD^1..HEAD (last merge diff)
+            echo "base=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+            echo "head=$(git rev-parse HEAD)"   >> "$GITHUB_OUTPUT"
+            echo "paths=data-products"          >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Route to production or snapshot Artifactory ───────────────────────
+      - name: Set Artifactory URL
+        shell: bash
+        run: |
+          IS_PRODUCTION="false"
+
+          if [[ "${{ github.event.pull_request.merged }}" == "true" ]]; then
+            IS_PRODUCTION="true"
+          fi
+          if [[ "${{ inputs.force-production-publish }}" == "true" ]]; then
+            IS_PRODUCTION="true"
+          fi
+
+          if [[ "$IS_PRODUCTION" == "true" ]]; then
+            echo "ARTIFACTORY_URL=${{ secrets.ARTIFACTORY_PACKAGE_URL }}" >> "$GITHUB_ENV"
+            echo "Publishing to PRODUCTION Artifactory"
+          else
+            echo "ARTIFACTORY_URL=${{ secrets.ARTIFACTORY_SNAPSHOT_URL }}" >> "$GITHUB_ENV"
+            echo "Publishing to SNAPSHOT Artifactory"
+          fi
+
+      # ── Build & publish ───────────────────────────────────────────────────
+      - name: Build and publish packages
+        id: build-publish
+        uses: grid-platform/df-actions/daap-build-publish@v1
+        with:
+          data-product-paths:      ${{ steps.config.outputs.paths }}
+          data-assets-path:        data-assets
+          base-sha:                ${{ steps.config.outputs.base }}
+          head-sha:                ${{ steps.config.outputs.head }}
+          # Version bump check runs on open PRs only (merged == false / push / dispatch → skip)
+          skip-version-check: >-
+            ${{
+              github.event.pull_request.merged == 'true'
+              || inputs.force-production-publish == true
+              || github.event_name == 'push'
+            }}
+          # --force on snapshot; not on production merge (idempotent safety)
+          allow-overwrite: >-
+            ${{
+              github.event.pull_request.merged != 'true'
+              && inputs.force-production-publish != true
+            }}
+          artifactory-username:    ${{ secrets.ARTIFACTORY_USR }}
+          artifactory-password:    ${{ secrets.ARTIFACTORY_PWD }}
+          artifactory-package-url: ${{ env.ARTIFACTORY_URL }}
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB: deploy
+  # Only runs when the publish job succeeded AND this is a production event.
+  # ────────────────────────────────────────────────────────────────────────────
+  deploy:
+    needs: publish
+    if: >-
+      needs.publish.result == 'success'
+      && (
+        github.event.pull_request.merged == 'true'
+        || inputs.force-production-publish == true
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy packages to cluster
+        uses: grid-platform/df-actions/daap-deploy@v1
+        with:
+          packages:    ${{ needs.publish.outputs.published-packages }}
+          kube-config: ${{ secrets.KUBE_CONFIG }}
+          method:      Overwrite
+          retry-limit: "0"
+          # Uncomment to run custom post-deploy steps:
+          # custom-commands: |
+          #   daap package download sandbox-data
+          #   daap package extract -p sandbox-data.zip
+          #   cd sandbox-data && chmod +x ./scripts/custom_commands.sh
+          #   ./scripts/custom_commands.sh
+          #
+          # Uncomment to inject extra env vars or Kubernetes resources:
+          # extra-env: |
+          #   MY_EXTRA_VAR=hello
+          # extra-secret-refs:    "my-extra-secret"
+          # extra-configmap-refs: "my-extra-config"

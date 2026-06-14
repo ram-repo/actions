@@ -1,0 +1,175 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared Action: daap-build-publish
+# Repository:   grid-platform/df-actions
+# Purpose:      Validates version bumps, builds package zips, and publishes
+#               them to Artifactory. Iterates over every path listed in
+#               data-product-paths in a single action call.
+#
+# Supports:
+#   - Explicit product path (co-location pattern) — path contains manifest.yaml
+#   - Mono-repo parent directory — every immediate subdir scanned automatically
+#   - Change detection via base-sha / head-sha
+#   - Version bump enforcement on open PRs (skip-version-check: false)
+#   - Snapshot vs production routing via artifactory-package-url input
+# ─────────────────────────────────────────────────────────────────────────────
+name: "DAAP Build & Publish"
+description: >
+  Validates version bumps, builds package zips, and publishes them to
+  Artifactory. Accepts a multiline data-product-paths input to process
+  one or more products in a single call.
+
+inputs:
+  # ── Required ───────────────────────────────────────────────────────────────
+  data-product-paths:
+    description: >
+      One entry per line. If a path has manifest.yaml at its root it is used
+      directly (explicit / co-location mode). If it does not, every immediate
+      subdirectory is scanned (mono-repo mode); subdirs without manifest.yaml
+      are skipped silently. Both plain and YAML list format (leading "- ")
+      are accepted.
+    required: true
+
+  data-assets-path:
+    description: >
+      Root path for all data assets. Assets are resolved at
+      <path>/<package_id>/<asset_id>/. Typically "data-assets" at the repo
+      root but any relative path is accepted.
+    required: true
+
+  artifactory-username:
+    description: "Artifactory username"
+    required: true
+
+  artifactory-password:
+    description: >
+      Artifactory password. Also used for Docker registry login to pull the
+      DAAP CLI image.
+    required: true
+
+  artifactory-package-url:
+    description: >
+      Full URL to the target Artifactory package repository (production or
+      snapshot). The consumer workflow is responsible for routing to the
+      correct URL based on trigger type.
+    required: true
+
+  # ── Optional — change detection & version check ───────────────────────────
+  base-sha:
+    description: >
+      Base commit SHA for change detection and version bump diff.
+      On PR events:         github.event.pull_request.base.sha
+      On branch pushes:     HEAD^1 (computed in consumer workflow)
+      On tag push:          leave empty — change detection is skipped and all
+                            products are published unconditionally.
+      On workflow_dispatch with explicit products: leave empty.
+    required: false
+    default: ""
+
+  head-sha:
+    description: >
+      Head commit SHA for change detection and version bump diff.
+      On PR events:         github.sha
+      On branch pushes:     HEAD (computed in consumer workflow)
+      Leave empty when base-sha is empty.
+    required: false
+    default: ""
+
+  skip-version-check:
+    description: >
+      When true, skips the manifest.yaml version bump check. Set to true for
+      all non-PR triggers (post-merge, branch push, tag push, dispatch). The
+      version was already validated on the open PR.
+    required: false
+    default: "false"
+
+  allow-overwrite:
+    description: >
+      When true, passes --force to "daap package publish", allowing overwrite
+      of an existing artifact at the same version in Artifactory. Independent
+      of artifactory-package-url — both snapshot and production combinations
+      are valid (e.g. allow-overwrite=true + production URL on tag push).
+    required: false
+    default: "false"
+
+  # ── Optional — Docker registry ────────────────────────────────────────────
+  docker-registry:
+    description: "Docker registry hosting the DAAP CLI image"
+    required: false
+    default: "gart.software.power-v.com"
+
+outputs:
+  published-packages:
+    description: >
+      Newline-separated list of all package_id values successfully published.
+      Pass directly to daap-deploy's packages input via
+      ${{ needs.publish.outputs.published-packages }}.
+    value: ${{ steps.collect-outputs.outputs.published-packages }}
+
+  package-ids:
+    description: >
+      Newline-separated list of package_id values (one per resolved path,
+      same order as input).
+    value: ${{ steps.collect-outputs.outputs.package-ids }}
+
+  versions:
+    description: >
+      Newline-separated list of version values (one per resolved path,
+      same order as package-ids).
+    value: ${{ steps.collect-outputs.outputs.versions }}
+
+runs:
+  using: composite
+  steps:
+    # ── 0. Docker login (needed to pull the DAAP CLI image) ─────────────────
+    - name: Docker login
+      shell: bash
+      run: |
+        echo "${{ inputs.artifactory-password }}" | \
+          docker login "${{ inputs.docker-registry }}" \
+            --username "${{ inputs.artifactory-username }}" \
+            --password-stdin
+
+    # ── 1. Build & publish loop ──────────────────────────────────────────────
+    - name: Build and publish packages
+      id: build-publish
+      shell: bash
+      env:
+        ARTIFACTORY_USERNAME:    ${{ inputs.artifactory-username }}
+        ARTIFACTORY_PASSWORD:    ${{ inputs.artifactory-password }}
+        ARTIFACTORY_PACKAGE_URL: ${{ inputs.artifactory-package-url }}
+        DATA_PRODUCT_PATHS:      ${{ inputs.data-product-paths }}
+        DATA_ASSETS_PATH:        ${{ inputs.data-assets-path }}
+        BASE_SHA:                ${{ inputs.base-sha }}
+        HEAD_SHA:                ${{ inputs.head-sha }}
+        SKIP_VERSION_CHECK:      ${{ inputs.skip-version-check }}
+        ALLOW_OVERWRITE:         ${{ inputs.allow-overwrite }}
+        DOCKER_REGISTRY:         ${{ inputs.docker-registry }}
+        GITHUB_TOKEN:            ${{ github.token }}
+        PR_NUMBER:               ${{ github.event.pull_request.number }}
+        REPO_OWNER:              ${{ github.repository_owner }}
+        REPO_NAME:               ${{ github.event.repository.name }}
+      run: ${{ github.action_path }}/scripts/build-publish.sh
+
+    # ── 2. Collect outputs ───────────────────────────────────────────────────
+    - name: Collect outputs
+      id: collect-outputs
+      shell: bash
+      run: |
+        if [[ -f /tmp/daap-published-packages.txt ]]; then
+          PKGS=$(cat /tmp/daap-published-packages.txt)
+          echo "published-packages<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$PKGS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "package-ids<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/daap-package-ids.txt >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "versions<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/daap-versions.txt >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+        else
+          echo "published-packages=" >> "$GITHUB_OUTPUT"
+          echo "package-ids=" >> "$GITHUB_OUTPUT"
+          echo "versions=" >> "$GITHUB_OUTPUT"
+        fi

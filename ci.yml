@@ -1,0 +1,259 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Consumer Workflow: Microservice-Gated Co-location Pattern
+#
+# Use when the data product is only valid against the microservice version
+# published in the same CI run (e.g. data contracts reflect the microservice's
+# current API shape).
+#
+# Job dependency graph:
+#
+#   [open PR]
+#   microservice-build-test ────────────────────────► daap-publish (snapshot)
+#
+#   [merge to main]
+#   microservice-build-test ──► microservice-publish ──► daap-publish (prod) ──► daap-deploy
+#
+# Repository structure assumed:
+#   src/                      # Microservice source
+#   tests/
+#   daap/
+#     my-product/
+#       manifest.yaml         # package_id: my-product, version: 1.1.0
+#       dataproduct.yaml
+#     data-assets/
+#       my-product/
+#         <asset_id>/
+#           <file>
+# ─────────────────────────────────────────────────────────────────────────────
+name: CI — Microservice + DAAP (Co-location / Microservice-Gated)
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, closed]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "daap/**"
+
+  push:
+    # Non-main branch pushes produce snapshot publishes.
+    branches-ignore: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "daap/**"
+
+  workflow_dispatch:
+    inputs:
+      force-production-publish:
+        description: >
+          Force publish data product to production Artifactory.
+          Use to retry after a transient failure on main.
+          The fixed co-located product path is always processed (no SHA diff).
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 1: Microservice — build & test
+  # Runs on every event (PR, push, dispatch). Gate for all downstream jobs.
+  # ────────────────────────────────────────────────────────────────────────────
+  microservice-build-test:
+    if: github.event.action != 'closed' || github.event.pull_request.merged == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Replace with your actual build / test steps ────────────────────────
+      - name: Set up language runtime
+        uses: actions/setup-python@v5   # example; swap for your language
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+      - name: Lint
+        run: |
+          pip install ruff
+          ruff check src/
+
+      # Store any build artefacts needed by microservice-publish
+      - name: Build Docker image
+        run: |
+          docker build -t my-service:${{ github.sha }} .
+          docker save my-service:${{ github.sha }} | gzip > /tmp/my-service.tar.gz
+
+      - name: Upload image artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/my-service.tar.gz
+          retention-days: 1
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 2: Microservice — publish artifact
+  # Only runs on merge to main or force-production-publish dispatch.
+  # ────────────────────────────────────────────────────────────────────────────
+  microservice-publish:
+    needs: microservice-build-test
+    if: >-
+      needs.microservice-build-test.result == 'success'
+      && (
+        github.event.pull_request.merged == 'true'
+        || inputs.force-production-publish == true
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download image artefact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Push Docker image to registry
+        run: |
+          docker load < /tmp/my-service.tar.gz
+          # Replace with your registry and push commands:
+          # docker tag my-service:${{ github.sha }} registry.example.com/my-service:${{ github.sha }}
+          # docker push registry.example.com/my-service:${{ github.sha }}
+          echo "Pushed my-service:${{ github.sha }}"
+
+      - name: Publish Helm chart (example)
+        run: |
+          # helm package ./chart --version ${{ github.sha }}
+          # helm push my-service-chart.tgz oci://registry.example.com/charts
+          echo "Published Helm chart"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 3: DAAP — build & publish
+  #
+  # Open PR  → snapshot Artifactory; gated on microservice build passing only.
+  # Merge    → production Artifactory; gated on microservice-publish succeeding.
+  # Push     → snapshot Artifactory; gated on microservice build passing.
+  #
+  # `always()` is required because GitHub Actions skips downstream jobs when
+  # ANY listed dependency is skipped. Without it, this job would be skipped on
+  # open PRs when microservice-publish is skipped. The explicit result checks
+  # restore the correct gate logic.
+  # ────────────────────────────────────────────────────────────────────────────
+  daap-publish:
+    needs: [microservice-build-test, microservice-publish]
+    if: >-
+      always()
+      && needs.microservice-build-test.result == 'success'
+      && (
+        needs.microservice-publish.result == 'success'
+        || needs.microservice-publish.result == 'skipped'
+      )
+      && (
+        github.event.action != 'closed'
+        || github.event.pull_request.merged == 'true'
+      )
+    runs-on: ubuntu-latest
+
+    outputs:
+      published-packages: ${{ steps.build-publish.outputs.published-packages }}
+
+    steps:
+      - name: Checkout (full history for change detection)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Route to production or snapshot Artifactory ───────────────────────
+      - name: Set Artifactory URL
+        shell: bash
+        run: |
+          if [[ "${{ github.event.pull_request.merged }}" == "true" ]] \
+          || [[ "${{ inputs.force-production-publish }}" == "true" ]]; then
+            echo "ARTIFACTORY_URL=${{ secrets.ARTIFACTORY_PACKAGE_URL }}" >> "$GITHUB_ENV"
+            echo "Publishing to PRODUCTION Artifactory"
+          else
+            echo "ARTIFACTORY_URL=${{ secrets.ARTIFACTORY_SNAPSHOT_URL }}" >> "$GITHUB_ENV"
+            echo "Publishing to SNAPSHOT Artifactory"
+          fi
+
+      # ── Build & publish ───────────────────────────────────────────────────
+      # data-product-paths uses explicit mode (path contains manifest.yaml)
+      # base-sha/head-sha: PR SHAs or HEAD^1/HEAD for branch pushes.
+      # For force-production-publish dispatch: empty SHAs → change detection
+      # skipped → always processes the fixed path.
+      - name: Resolve SHAs
+        id: shas
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.sha }}"                          >> "$GITHUB_OUTPUT"
+          elif [[ "${{ inputs.force-production-publish }}" == "true" ]]; then
+            # Force dispatch: skip change detection → always process
+            echo "base=" >> "$GITHUB_OUTPUT"
+            echo "head=" >> "$GITHUB_OUTPUT"
+          else
+            # Branch push
+            echo "base=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+            echo "head=$(git rev-parse HEAD)"   >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and publish data product
+        id: build-publish
+        uses: grid-platform/df-actions/daap-build-publish@v1
+        with:
+          # Explicit mode: path contains manifest.yaml at its root
+          data-product-paths:      daap/my-product
+          data-assets-path:        daap/data-assets
+          base-sha:                ${{ steps.shas.outputs.base }}
+          head-sha:                ${{ steps.shas.outputs.head }}
+          skip-version-check: >-
+            ${{
+              github.event.pull_request.merged == 'true'
+              || github.event_name == 'push'
+              || inputs.force-production-publish == true
+            }}
+          allow-overwrite: >-
+            ${{
+              github.event.pull_request.merged != 'true'
+              && inputs.force-production-publish != true
+            }}
+          artifactory-username:    ${{ secrets.ARTIFACTORY_USR }}
+          artifactory-password:    ${{ secrets.ARTIFACTORY_PWD }}
+          artifactory-package-url: ${{ env.ARTIFACTORY_URL }}
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 4: DAAP — deploy
+  # Gated on BOTH microservice-publish AND daap-publish succeeding.
+  # This ensures the data product is never deployed unless the corresponding
+  # microservice version was successfully published first.
+  # ────────────────────────────────────────────────────────────────────────────
+  daap-deploy:
+    needs: [microservice-publish, daap-publish]
+    if: >-
+      needs.microservice-publish.result == 'success'
+      && needs.daap-publish.result == 'success'
+      && (
+        github.event.pull_request.merged == 'true'
+        || inputs.force-production-publish == true
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy data product to cluster
+        uses: grid-platform/df-actions/daap-deploy@v1
+        with:
+          packages:    ${{ needs.daap-publish.outputs.published-packages }}
+          kube-config: ${{ secrets.KUBE_CONFIG }}
+          method:      Overwrite
+          retry-limit: "0"
