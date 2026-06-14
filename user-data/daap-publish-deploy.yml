@@ -1,0 +1,187 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Consumer Workflow: Tag-as-Release Pattern
+#
+# A pushed tag is the production release gate; NOT a merge to main.
+# All branch pushes (including main) and PR merges publish to snapshot.
+# Only a tag push triggers a production publish and deploy.
+#
+# Routing summary:
+#   Open PR             → snapshot Artifactory  (version bump check ON)
+#   Push to any branch  → snapshot Artifactory  (version bump check OFF)
+#   PR merged to main   → snapshot Artifactory  (main merge ≠ release gate)
+#   Tag pushed          → PRODUCTION Artifactory (all products; --force)
+#   workflow_dispatch   → PRODUCTION Artifactory (retry after failed tag push)
+#
+# Repository structure assumed:
+#   data-products/
+#     product-a/
+#       manifest.yaml
+#       ...
+#     product-b/
+#       manifest.yaml
+#       ...
+#   data-assets/
+#     product-a/ ...
+#     product-b/ ...
+# ─────────────────────────────────────────────────────────────────────────────
+name: DAAP — Publish & Deploy (Tag-as-Release)
+
+on:
+  pull_request:
+    branches: ["**"]
+    types: [opened, synchronize, reopened, closed]
+    paths:
+      - "data-products/**"
+      - "data-assets/**"
+
+  push:
+    branches: ["**"]        # ALL branch pushes (including main) → snapshot
+    tags:
+      - "**"
+      - "!ge/ci/*/*"        # Exclude Vulcan CI automation tags.
+                            # Adapt to your own CI automation tag pattern.
+    paths:
+      # NOTE: GitHub Actions ignores `paths:` for tag pushes.
+      # The filter only applies to branch pushes.
+      - "data-products/**"
+      - "data-assets/**"
+
+  workflow_dispatch:
+    inputs:
+      force-production-publish:
+        description: >
+          Force publish to production Artifactory.
+          Use to retry after a transient failure on a tag push.
+          Can be run from any branch (tag-as-release teams do not restrict this
+          to main because the tag may be on a release branch).
+        type: boolean
+        default: false
+
+concurrency:
+  group: daap-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB: publish
+  # ────────────────────────────────────────────────────────────────────────────
+  publish:
+    # Always run on push (branch or tag). Skip closed-without-merge PRs.
+    if: >-
+      github.event_name == 'push'
+      || github.event_name == 'workflow_dispatch'
+      || (
+        github.event_name == 'pull_request'
+        && (
+          github.event.action != 'closed'
+          || github.event.pull_request.merged == 'true'
+        )
+      )
+    runs-on: ubuntu-latest
+
+    outputs:
+      published-packages: ${{ steps.build-publish.outputs.published-packages }}
+
+    steps:
+      - name: Checkout (full history for change detection)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Resolve trigger context ───────────────────────────────────────────
+      # Outputs: base, head, skip-version-check, allow-overwrite
+      - name: Resolve trigger context
+        id: config
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # PR event: change detection + version bump check on open PRs
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.sha }}"                          >> "$GITHUB_OUTPUT"
+            # Version check: skip only when the PR is merged (main merge → snapshot, not release gate)
+            MERGED="${{ github.event.pull_request.merged }}"
+            echo "skip-version-check=${MERGED}"    >> "$GITHUB_OUTPUT"
+            echo "allow-overwrite=true"             >> "$GITHUB_OUTPUT"
+
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            # Tag push: publish ALL products unconditionally to production.
+            # base-sha intentionally empty — no reliable previous production tag
+            # (teams use tags for multiple purposes; diffing against the previous
+            # tag is not safe).
+            # allow-overwrite=true because some products may already exist in
+            # production at the same version from a previous tag push.
+            echo "base=" >> "$GITHUB_OUTPUT"
+            echo "head=" >> "$GITHUB_OUTPUT"
+            echo "skip-version-check=true" >> "$GITHUB_OUTPUT"
+            echo "allow-overwrite=true"    >> "$GITHUB_OUTPUT"
+
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # Dispatch: retry production publish; detect changed products via
+            # HEAD^1..HEAD (last merge or commit diff on the current branch).
+            echo "base=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+            echo "head=$(git rev-parse HEAD)"   >> "$GITHUB_OUTPUT"
+            echo "skip-version-check=true"      >> "$GITHUB_OUTPUT"
+            echo "allow-overwrite=false"        >> "$GITHUB_OUTPUT"
+
+          else
+            # Branch push (including main): snapshot; change detection via HEAD^1
+            echo "base=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+            echo "head=$(git rev-parse HEAD)"   >> "$GITHUB_OUTPUT"
+            echo "skip-version-check=true"      >> "$GITHUB_OUTPUT"
+            echo "allow-overwrite=true"         >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Route to production or snapshot Artifactory ───────────────────────
+      # Tag-as-release: only a tag push (or force-production-publish) routes
+      # to production. All other triggers — including a push to main — route
+      # to snapshot. This is the key difference from the merge-as-release pattern.
+      - name: Set Artifactory URL
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]] \
+          || [[ "${{ inputs.force-production-publish }}" == "true" ]]; then
+            echo "ARTIFACTORY_URL=${{ secrets.ARTIFACTORY_PACKAGE_URL }}" >> "$GITHUB_ENV"
+            echo "Publishing to PRODUCTION Artifactory (tag push or force)"
+          else
+            echo "ARTIFACTORY_URL=${{ secrets.ARTIFACTORY_SNAPSHOT_URL }}" >> "$GITHUB_ENV"
+            echo "Publishing to SNAPSHOT Artifactory"
+          fi
+
+      # ── Build & publish ───────────────────────────────────────────────────
+      - name: Build and publish packages
+        id: build-publish
+        uses: grid-platform/df-actions/daap-build-publish@v1
+        with:
+          data-product-paths:      data-products
+          data-assets-path:        data-assets
+          base-sha:                ${{ steps.config.outputs.base }}
+          head-sha:                ${{ steps.config.outputs.head }}
+          skip-version-check:      ${{ steps.config.outputs.skip-version-check }}
+          allow-overwrite:         ${{ steps.config.outputs.allow-overwrite }}
+          artifactory-username:    ${{ secrets.ARTIFACTORY_USR }}
+          artifactory-password:    ${{ secrets.ARTIFACTORY_PWD }}
+          artifactory-package-url: ${{ env.ARTIFACTORY_URL }}
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB: deploy
+  # Runs only on tag push or force-production-publish dispatch.
+  # Never runs on PRs or branch pushes (including main merges).
+  # ────────────────────────────────────────────────────────────────────────────
+  deploy:
+    needs: publish
+    if: >-
+      needs.publish.result == 'success'
+      && (
+        github.ref_type == 'tag'
+        || inputs.force-production-publish == true
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy packages to cluster
+        uses: grid-platform/df-actions/daap-deploy@v1
+        with:
+          packages:    ${{ needs.publish.outputs.published-packages }}
+          kube-config: ${{ secrets.KUBE_CONFIG }}
+          method:      Overwrite
+          retry-limit: "0"

@@ -1,0 +1,148 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared Action: daap-deploy
+# Repository:   grid-platform/df-actions
+# Purpose:      Creates a Kubernetes Job that installs or overwrites one or
+#               more data products in the target environment using the DAAP CLI.
+#
+# The Job's standard environment (service URLs, credentials) is always
+# pre-configured in the cluster via well-known Secrets. The extra-* inputs
+# allow callers to append additional resources on top without modifying the
+# action itself.
+# ─────────────────────────────────────────────────────────────────────────────
+name: "DAAP Deploy"
+description: >
+  Creates a Kubernetes Job that installs or overwrites the data product(s)
+  in the target environment by running the DAAP CLI inside the cluster.
+
+inputs:
+  # ── Required ───────────────────────────────────────────────────────────────
+  packages:
+    description: >
+      One package identifier per line. The Job iterates over each entry and
+      runs "daap package deploy <pkg>" for each. Both plain and YAML list
+      format (leading "- ") are accepted.
+
+      Example (plain):
+        packages: |
+          df-overview
+          product-b
+
+      Example (YAML list):
+        packages: |
+          - df-overview
+          - product-b
+    required: true
+
+  kube-config:
+    description: "Base64-encoded kubeconfig granting access to the target Kubernetes cluster"
+    required: true
+
+  # ── Optional — Job behaviour ───────────────────────────────────────────────
+  method:
+    description: >
+      Deployment method passed to the DAAP CLI.
+      Overwrite (default) — replaces an existing data product entirely.
+      Upgrade             — reserved for future incremental logic; currently
+                            accepted without error but may behave like Overwrite
+                            until the CLI implements the distinction.
+    required: false
+    default: "Overwrite"
+
+  retry-limit:
+    description: >
+      Kubernetes Job backoffLimit. 0 = no automatic retry (reference default).
+      Increase to handle transient startup races or out-of-order credential
+      deployments. Each retry creates a new Pod (restartPolicy: Never).
+    required: false
+    default: "0"
+
+  namespace:
+    description: "Kubernetes namespace in which to create the Job"
+    required: false
+    default: "default"
+
+  job-timeout:
+    description: "Seconds to wait for the Job to complete before timing out"
+    required: false
+    default: "600"
+
+  # ── Optional — Custom commands ─────────────────────────────────────────────
+  custom-commands:
+    description: >
+      One shell command per line; executed in order inside the Job container
+      after all packages have been deployed. Mirrors the
+      customCommands.commands list in the Helm values.
+
+      Example:
+        custom-commands: |
+          daap package download sandbox-data
+          daap package extract -p sandbox-data.zip
+    required: false
+    default: ""
+
+  # ── Optional — Additive extras (appended to standard baseline env) ─────────
+  extra-env:
+    description: >
+      Additional env vars in KEY=VALUE format, one per line; appended to the
+      container's fixed env list.
+
+      Example:
+        extra-env: |
+          MY_EXTRA_VAR=hello
+          ANOTHER_VAR=world
+    required: false
+    default: ""
+
+  extra-secret-refs:
+    description: >
+      Space-separated names of additional Kubernetes Secrets to inject via
+      envFrom.secretRef.
+
+      Example:  extra-secret-refs: "my-extra-secret another-secret"
+    required: false
+    default: ""
+
+  extra-configmap-refs:
+    description: >
+      Space-separated names of additional Kubernetes ConfigMaps to inject via
+      envFrom.configMapRef.
+
+      Example:  extra-configmap-refs: "my-extra-config"
+    required: false
+    default: ""
+
+  # ── Optional — Docker registry ────────────────────────────────────────────
+  docker-registry:
+    description: "Docker registry for utility images (dockerize wait image)"
+    required: false
+    default: "gart.software.power-v.com"
+
+outputs:
+  job-name:
+    description: "Name of the Kubernetes Job that was created"
+    value: ${{ steps.deploy.outputs.job-name }}
+
+  status:
+    description: "Final Job status: Succeeded or Failed"
+    value: ${{ steps.deploy.outputs.status }}
+
+runs:
+  using: composite
+  steps:
+    - name: Generate and apply Kubernetes Job
+      id: deploy
+      shell: bash
+      env:
+        PACKAGES:             ${{ inputs.packages }}
+        KUBE_CONFIG:          ${{ inputs.kube-config }}
+        METHOD:               ${{ inputs.method }}
+        RETRY_LIMIT:          ${{ inputs.retry-limit }}
+        NAMESPACE:            ${{ inputs.namespace }}
+        JOB_TIMEOUT:          ${{ inputs.job-timeout }}
+        DAAP_CUSTOM_COMMANDS: ${{ inputs.custom-commands }}
+        EXTRA_ENV:            ${{ inputs.extra-env }}
+        EXTRA_SECRET_REFS:    ${{ inputs.extra-secret-refs }}
+        EXTRA_CONFIGMAP_REFS: ${{ inputs.extra-configmap-refs }}
+        DOCKER_REGISTRY:      ${{ inputs.docker-registry }}
+        GITHUB_RUN_ID:        ${{ github.run_id }}
+      run: ${{ github.action_path }}/scripts/deploy.sh
